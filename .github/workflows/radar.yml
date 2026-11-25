@@ -1,0 +1,476 @@
+name: Dual-Engine USD Liquidity Radar
+
+
+
+on:
+
+  schedule:
+
+    - cron: '15 14 * * 1-5'
+
+  workflow_dispatch:
+
+
+
+jobs:
+
+  run-liquidity-radar:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Run Dual-Engine USD Liquidity Radar & Push WeChat
+
+        env:
+
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+
+        run: |
+
+          python3 - << 'EOF'
+
+          import os, sys, csv, io, json, datetime, traceback, urllib.request, urllib.parse
+
+
+
+          DEFAULT_PUSHPLUS_TOKEN = "20e17886ceaf4a9c9d4cf1a061844759"
+
+
+
+          def fetch_fred_series(series_id, lookback_rows=15):
+
+              url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+
+              try:
+
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/csv,*/*"})
+
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+
+                      text = resp.read().decode("utf-8", errors="ignore")
+
+                  rows = []
+
+                  reader = csv.reader(io.StringIO(text))
+
+                  next(reader, None)
+
+                  for row in reader:
+
+                      if len(row) >= 2 and row[1].strip() not in ("", "."):
+
+                          try:
+
+                              rows.append((row[0].strip(), float(row[1].strip())))
+
+                          except ValueError:
+
+                              pass
+
+                  return rows[-lookback_rows:]
+
+              except Exception as e:
+
+                  print(f"[WARN] FRED {series_id}: {e}")
+
+                  return []
+
+
+
+          def fetch_nyfed_sofr_p99(fallback_sofr):
+
+              url = "https://markets.newyorkfed.org/api/rates/secured/sofr/last/5.json"
+
+              try:
+
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+
+                      data = json.loads(resp.read().decode("utf-8"))
+
+                  rates = sorted(data.get("refRates", []), key=lambda x: x.get("effectiveDate", ""))
+
+                  if rates and rates[-1].get("percentPercentile99") is not None:
+
+                      return float(rates[-1]["percentPercentile99"])
+
+              except Exception as e:
+
+                  print(f"[WARN] NYFed P99: {e}")
+
+              return round(fallback_sofr + 0.07, 2)
+
+
+
+          def fetch_nyfed_srf_usage():
+
+              url = "https://markets.newyorkfed.org/api/rp/results/search.json"
+
+              try:
+
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+
+                  with urllib.request.urlopen(req, timeout=15) as resp:
+
+                      data = json.loads(resp.read().decode("utf-8"))
+
+                  ops = data.get("repo", {}).get("operations", [])
+
+                  repo_ops = [op for op in ops if str(op.get("operationType", "")).lower().startswith("repo")]
+
+                  if not repo_ops:
+
+                      return ("最近交易日", 0.0)
+
+                  latest_date = max(str(op.get("operationDate", "")) for op in repo_ops)
+
+                  daily_total = sum(float(op.get("totalAmtAccepted", 0) or 0) for op in repo_ops if op.get("operationDate") == latest_date)
+
+                  srf_b = daily_total / 1e9 if daily_total > 1e7 else (daily_total / 1e3 if daily_total > 1e3 else daily_total)
+
+                  return (latest_date, round(srf_b, 2))
+
+              except Exception as e:
+
+                  print(f"[WARN] NYFed SRF: {e}")
+
+                  return ("N/A", 0.0)
+
+
+
+          def fetch_quote(yahoo_ticker, fred_id, default_val=0.0):
+
+              try:
+
+                  enc = urllib.parse.quote(yahoo_ticker)
+
+                  url = f"https://query2.finance.yahoo.com/v8/finance/chart/{enc}?interval=1d&range=15d"
+
+                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+
+                  with urllib.request.urlopen(req, timeout=12) as resp:
+
+                      data = json.loads(resp.read().decode("utf-8"))
+
+                  res = data["chart"]["result"][0]
+
+                  ts_list = res.get("timestamp", [])
+
+                  c_list = res["indicators"]["quote"][0].get("close", [])
+
+                  valid = [(datetime.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d"), round(float(c), 2)) for ts, c in zip(ts_list, c_list) if c is not None]
+
+                  if len(valid) >= 2:
+
+                      dt, lc = valid[-1]
+
+                      _, pc = valid[-2]
+
+                      pct = ((lc - pc) / pc) * 100.0 if pc else 0.0
+
+                      return (lc, round(pct, 2), dt, round(max(c for _, c in valid[-6:]), 2))
+
+              except Exception:
+
+                  pass
+
+              if fred_id:
+
+                  rows = fetch_fred_series(fred_id, 10)
+
+                  if len(rows) >= 2:
+
+                      dt, lc = rows[-1]
+
+                      _, pc = rows[-2]
+
+                      pct = ((lc - pc) / pc) * 100.0 if pc else 0.0
+
+                      return (round(lc, 2), round(pct, 2), dt, round(max(c for _, c in rows[-6:]), 2))
+
+              return (default_val, 0.0, "N/A", default_val)
+
+
+
+          def classify_calendar(dt_str):
+
+              try:
+
+                  d = datetime.date.fromisoformat(dt_str)
+
+              except Exception:
+
+                  return (False, False, "常规交易日")
+
+              nxt = (d.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+
+              cur = nxt - datetime.timedelta(days=1)
+
+              while cur.weekday() >= 5:
+
+                  cur -= datetime.timedelta(days=1)
+
+              if abs((cur - d).days) <= 2 or d.day <= 2:
+
+                  return (True, False, "月末/季末监管粉饰窗口 (T-1~T+1，自动剔除假阳性)")
+
+              if d.day in (15, 16, 17):
+
+                  return (False, True, "月中结算/缴税窗口 (降权1级观察T+2)")
+
+              return (False, False, "常规非月末交易日 (有效权重 100%)")
+
+
+
+          def send_pushplus(token, title, content_md):
+
+              url = "https://www.pushplus.plus/send"
+
+              body = json.dumps({"token": token, "title": title, "content": content_md, "template": "markdown"}).encode("utf-8")
+
+              req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}, method="POST")
+
+              with urllib.request.urlopen(req, timeout=20) as resp:
+
+                  print("[INFO] PushPlus 返回:", resp.read().decode("utf-8"))
+
+
+
+          token = os.getenv("PUSHPLUS_TOKEN", "").strip() or DEFAULT_PUSHPLUS_TOKEN
+
+          is_manual = os.getenv("GITHUB_EVENT_NAME", "") != "schedule"
+
+
+
+          try:
+
+              sofr_rows = fetch_fred_series("SOFR", 15)
+
+              iorb_rows = fetch_fred_series("IORB", 15)
+
+              rrp_rows = fetch_fred_series("RRPONTSYD", 10)
+
+              res_rows = fetch_fred_series("WRESBAL", 10)
+
+              tga_rows = fetch_fred_series("WTREGEN", 10)
+
+
+
+              iorb_val = iorb_rows[-1][1] if iorb_rows else 3.90
+
+              iorb_map = dict(iorb_rows)
+
+              history = []
+
+              last_iorb = iorb_val
+
+              for dt_str, s_val in sofr_rows:
+
+                  if dt_str in iorb_map:
+
+                      last_iorb = iorb_map[dt_str]
+
+                  is_me, is_mid, cal_lbl = classify_calendar(dt_str)
+
+                  history.append({"date": dt_str, "sofr": s_val, "iorb": last_iorb, "spread_bps": round((s_val - last_iorb) * 100.0, 1), "is_me": is_me, "is_mid": is_mid, "cal": cal_lbl})
+
+              if not history:
+
+                  history = [{"date": datetime.date.today().isoformat(), "sofr": 3.90, "iorb": 3.90, "spread_bps": 0.0, "is_me": False, "is_mid": False, "cal": "常规交易日"}]
+
+
+
+              latest = history[-1]
+
+              spread_bps = latest["spread_bps"]
+
+              non_me = [h for h in history if not h["is_me"]][-6:]
+
+              consec_gt_2 = 0
+
+              for h in reversed(non_me):
+
+                  if h["spread_bps"] >= 2.0:
+
+                      consec_gt_2 += 1
+
+                  else:
+
+                      break
+
+              recent_max = max((h["spread_bps"] for h in non_me), default=0.0)
+
+              repo_healed = (recent_max >= 3.0) and len(non_me) >= 2 and all(h["spread_bps"] <= 0.5 for h in non_me[-2:])
+
+
+
+              sofr_p99 = fetch_nyfed_sofr_p99(latest["sofr"])
+
+              srf_ceiling = round(latest["iorb"] + 0.10, 2)
+
+              srf_date, srf_b = fetch_nyfed_srf_usage()
+
+
+
+              raw_rrp = rrp_rows[-1][1] if rrp_rows else 0.3
+
+              on_rrp_b = round(raw_rrp / 1000.0 if raw_rrp > 5000 else raw_rrp, 2)
+
+              raw_res = res_rows[-1][1] if res_rows else 2980.0
+
+              wres_t = round(raw_res / 1e6 if raw_res > 1e5 else raw_res / 1e3, 3)
+
+              raw_tga = tga_rows[-1][1] if tga_rows else 917.0
+
+              prev_tga = tga_rows[-2][1] if len(tga_rows) >= 2 else raw_tga
+
+              tga_b = round(raw_tga / 1e3 if raw_tga > 1e4 else raw_tga, 1)
+
+              prev_tga_b = round(prev_tga / 1e3 if prev_tga > 1e4 else prev_tga, 1)
+
+              tga_delta_b = round(tga_b - prev_tga_b, 1)
+
+
+
+              vix_c, vix_chg, vix_dt, vix_5d_h = fetch_quote("^VIX", "VIXCLS", 20.0)
+
+              dxy_c, dxy_chg, _, _ = fetch_quote("DX-Y.NYB", "DTWEXBGS", 105.0)
+
+              _, spy_chg, _, _ = fetch_quote("SPY", "SP500", 0.0)
+
+              _, qqq_chg, _, _ = fetch_quote("QQQ", "NASDAQCOM", 0.0)
+
+              _, gld_chg, _, _ = fetch_quote("GLD", "", 0.0)
+
+
+
+              zero_buffer = (on_rrp_b < 50.0) and (wres_t < 3.00)
+
+              alerts, buys = [], []
+
+              risk = 1 if zero_buffer else 0
+
+
+
+              if not latest["is_me"]:
+
+                  if spread_bps >= 4.0 and (sofr_p99 > srf_ceiling or srf_b >= 15.0 or srf_b < 0.5):
+
+                      risk = 3
+
+                      alerts.append(f"【回购逼仓红灯】非月末 SOFR-IORB 达 +{spread_bps}bp，99分位 {sofr_p99:.2f}% vs SRF上限 {srf_ceiling:.2f}%")
+
+                  elif consec_gt_2 >= 3 or sofr_p99 > srf_ceiling:
+
+                      risk = max(risk, 2)
+
+                      alerts.append(f"【回购吃紧橙灯】连续 {consec_gt_2} 日非月末 SOFR-IORB >= +2bp (当前 +{spread_bps}bp)")
+
+
+
+              if vix_c >= 28.0 or (vix_c >= 25.0 and vix_chg >= 20.0):
+
+                  risk = 3
+
+                  alerts.append(f"【跨资产追保红灯】VIX 飙至 {vix_c} ({vix_chg:+.2f}%)，警惕科技股与黄金同跌换现")
+
+              elif vix_c >= 25.0 or vix_chg >= 15.0:
+
+                  risk = max(risk, 2)
+
+                  alerts.append(f"【波动率挤压橙灯】VIX 升至 {vix_c} ({vix_chg:+.2f}%)")
+
+
+
+              if vix_5d_h >= 28.0 and vix_chg <= -8.0 and spread_bps <= 2.0:
+
+                  buys.append(f"【恐慌出清·右侧买点】VIX 从5日高点 {vix_5d_h} 回落 {vix_chg:.2f}% 至 {vix_c}，强平盘出清")
+
+              if repo_healed and vix_c < 25.0:
+
+                  buys.append(f"【回购回血·右侧买点】SOFR-IORB 从 +{recent_max:.1f}bp 连续回落至 {spread_bps:+.1f}bp")
+
+              if tga_delta_b <= -50.0 and spread_bps <= 1.0 and risk < 3:
+
+                  buys.append(f"【财政放水·买点】TGA 单周向市场净投放 ${abs(tga_delta_b):.1f}B")
+
+
+
+              should_push = False
+
+              sig_type = "🟡 日常静默巡检 (零缓冲底色，无新增买卖点，平时不打扰)"
+
+              advice = "当前处于常规观察期，继续观望，无需操作"
+
+
+
+              if risk == 3 and not buys:
+
+                  should_push, sig_type, advice = True, "🔴 【危险警告·三级红灯】跨资产流动性逼仓", "立刻降杠杆防御！严禁在 VIX 急升首日抄底黄金对冲"
+
+              elif buys:
+
+                  should_push, sig_type, advice = True, "💎 【黄金买点信号】流动性回血 / 恐慌出清", "分批止盈 Put，逢低回补被错杀的核心科技股与黄金"
+
+              elif risk == 2:
+
+                  should_push, sig_type, advice = True, "🟠 【减仓预警·二级橙灯】局部流动性挤压", "主动削减高 Beta 科技/加密仓位，或买短期虚值 Put 保护"
+
+
+
+              prefix = "【手动测试验活】" if (is_manual and not should_push) else ""
+
+              title = f"{prefix}{sig_type} | SOFR {spread_bps:+.1f}bp | VIX {vix_c}"
+
+              lines = [
+
+                  f"### {prefix}{sig_type}",
+
+                  f"**核心操作指令**：**{advice}**",
+
+                  "",
+
+                  "#### 📊 核心流动性与跨资产快照",
+
+                  f"- **SOFR - IORB 利差 ({latest['date']})**：`{spread_bps:+.1f} bps`（99分位 `{sofr_p99:.2f}%` vs SRF上限 `{srf_ceiling:.2f}%`）",
+
+                  f"- **日历属性**：{latest['cal']}",
+
+                  f"- **准备金与缓冲垫**：准备金 `{wres_t}T` | ON RRP `${on_rrp_b}B` | SRF用量 `${srf_b}B`",
+
+                  f"- **财政部 TGA 余额**：`${tga_b}B`（周变动 `{tga_delta_b:+.1f}B`）",
+
+                  f"- **VIX 恐慌指数 ({vix_dt})**：`{vix_c}`（单日 `{vix_chg:+.2f}%`，5日高点 `{vix_5d_h}`）",
+
+                  f"- **跨资产表现**：标普 `{spy_chg:+.2f}%` | 纳指 `{qqq_chg:+.2f}%` | 黄金 `{gld_chg:+.2f}%` | 美元 `{dxy_c}`",
+
+              ]
+
+              if buys:
+
+                  lines.insert(3, "#### 💎 触发买点明细\n" + "\n".join(f"- {s}" for s in buys) + "\n")
+
+              if alerts:
+
+                  lines.insert(3, "#### ⚠️ 触发风险预警明细\n" + "\n".join(f"- {s}" for s in alerts) + "\n")
+
+
+
+              if should_push or is_manual:
+
+                  send_pushplus(token, title, "\n".join(lines))
+
+              else:
+
+                  print("[SILENT] 今日无新增买卖点，保持静默。")
+
+          except Exception as exc:
+
+              print(traceback.format_exc())
+
+              send_pushplus(token, "【美元流动性雷达】测试连通提醒", f"微信推送已连通，异常信息：`{exc}`")
+
+          EOF
+
