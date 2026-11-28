@@ -6,7 +6,9 @@ on:
 
   schedule:
 
-    - cron: '15 14 * * 1-5'
+    # 每个美股交易日 13:23 UTC (北京时间晚上 21:23，美股开盘前约1小时，避开整点排队延迟)
+
+    - cron: '23 13 * * 1-5'
 
   workflow_dispatch:
 
@@ -30,77 +32,53 @@ jobs:
 
           python3 - << 'EOF'
 
-          import os, sys, csv, io, json, datetime, traceback, urllib.request, urllib.parse
+          import os, sys, json, datetime, traceback, urllib.request, urllib.parse
 
 
 
           DEFAULT_PUSHPLUS_TOKEN = "20e17886ceaf4a9c9d4cf1a061844759"
 
+          CURRENT_IORB = 3.90
 
-
-          def fetch_fred_series(series_id, lookback_rows=15):
-
-              url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-
-              try:
-
-                  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/csv,*/*"})
-
-                  with urllib.request.urlopen(req, timeout=20) as resp:
-
-                      text = resp.read().decode("utf-8", errors="ignore")
-
-                  rows = []
-
-                  reader = csv.reader(io.StringIO(text))
-
-                  next(reader, None)
-
-                  for row in reader:
-
-                      if len(row) >= 2 and row[1].strip() not in ("", "."):
-
-                          try:
-
-                              rows.append((row[0].strip(), float(row[1].strip())))
-
-                          except ValueError:
-
-                              pass
-
-                  return rows[-lookback_rows:]
-
-              except Exception as e:
-
-                  print(f"[WARN] FRED {series_id}: {e}")
-
-                  return []
+          CURRENT_SRF_CEILING = 4.00
 
 
 
-          def fetch_nyfed_sofr_p99(fallback_sofr):
+          def fetch_nyfed_sofr_history(last_n=15):
 
-              url = "https://markets.newyorkfed.org/api/rates/secured/sofr/last/5.json"
+              url = f"https://markets.newyorkfed.org/api/rates/secured/sofr/last/{last_n}.json"
 
               try:
 
                   req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
 
-                  with urllib.request.urlopen(req, timeout=15) as resp:
+                  with urllib.request.urlopen(req, timeout=10) as resp:
 
                       data = json.loads(resp.read().decode("utf-8"))
 
                   rates = sorted(data.get("refRates", []), key=lambda x: x.get("effectiveDate", ""))
 
-                  if rates and rates[-1].get("percentPercentile99") is not None:
+                  result = []
 
-                      return float(rates[-1]["percentPercentile99"])
+                  for r in rates:
+
+                      dt = r.get("effectiveDate", "")
+
+                      rate = float(r.get("percentRate", CURRENT_IORB))
+
+                      p99 = float(r.get("percentPercentile99", rate + 0.07))
+
+                      vol = float(r.get("volumeInBillions", 0) or 0)
+
+                      result.append({"date": dt, "sofr": rate, "p99": p99, "vol_b": vol})
+
+                  return result
 
               except Exception as e:
 
-                  print(f"[WARN] NYFed P99: {e}")
+                  print(f"[WARN] NYFed SOFR 接口异常: {e}")
 
-              return round(fallback_sofr + 0.07, 2)
+                  return []
 
 
 
@@ -112,7 +90,7 @@ jobs:
 
                   req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
 
-                  with urllib.request.urlopen(req, timeout=15) as resp:
+                  with urllib.request.urlopen(req, timeout=10) as resp:
 
                       data = json.loads(resp.read().decode("utf-8"))
 
@@ -134,27 +112,29 @@ jobs:
 
               except Exception as e:
 
-                  print(f"[WARN] NYFed SRF: {e}")
+                  print(f"[WARN] NYFed SRF 接口异常: {e}")
 
                   return ("N/A", 0.0)
 
 
 
-          def fetch_quote(yahoo_ticker, fred_id, default_val=0.0):
+          def fetch_yahoo_quote(ticker, default_val=0.0):
 
               try:
 
-                  enc = urllib.parse.quote(yahoo_ticker)
+                  enc = urllib.parse.quote(ticker)
 
-                  url = f"https://query2.finance.yahoo.com/v8/finance/chart/{enc}?interval=1d&range=15d"
+                  url = f"https://query2.finance.yahoo.com/v8/finance/chart/{enc}?interval=1d&range=15d&includePrePost=true"
 
                   req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
 
-                  with urllib.request.urlopen(req, timeout=12) as resp:
+                  with urllib.request.urlopen(req, timeout=10) as resp:
 
                       data = json.loads(resp.read().decode("utf-8"))
 
                   res = data["chart"]["result"][0]
+
+                  meta = res.get("meta", {})
 
                   ts_list = res.get("timestamp", [])
 
@@ -168,27 +148,21 @@ jobs:
 
                       _, pc = valid[-2]
 
-                      pct = ((lc - pc) / pc) * 100.0 if pc else 0.0
+                      live_p = meta.get("regularMarketPrice")
 
-                      return (lc, round(pct, 2), dt, round(max(c for _, c in valid[-6:]), 2))
+                      if live_p is not None and abs(float(live_p) - lc) > 1e-4:
 
-              except Exception:
-
-                  pass
-
-              if fred_id:
-
-                  rows = fetch_fred_series(fred_id, 10)
-
-                  if len(rows) >= 2:
-
-                      dt, lc = rows[-1]
-
-                      _, pc = rows[-2]
+                          lc = round(float(live_p), 2)
 
                       pct = ((lc - pc) / pc) * 100.0 if pc else 0.0
 
-                      return (round(lc, 2), round(pct, 2), dt, round(max(c for _, c in rows[-6:]), 2))
+                      high_5d = round(max(c for _, c in valid[-6:]), 2)
+
+                      return (lc, round(pct, 2), dt, high_5d)
+
+              except Exception as e:
+
+                  print(f"[WARN] Yahoo {ticker}: {e}")
 
               return (default_val, 0.0, "N/A", default_val)
 
@@ -206,19 +180,17 @@ jobs:
 
               nxt = (d.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
 
-              cur = nxt - datetime.timedelta(days=1)
+              last_day = nxt - datetime.timedelta(days=1)
 
-              while cur.weekday() >= 5:
+              bdays_left = sum(1 for i in range((last_day - d).days + 1) if (d + datetime.timedelta(days=i)).weekday() < 5)
 
-                  cur -= datetime.timedelta(days=1)
+              if bdays_left <= 4 or d.day <= 2:
 
-              if abs((cur - d).days) <= 2 or d.day <= 2:
-
-                  return (True, False, "月末/季末监管粉饰窗口 (T-1~T+1，自动剔除假阳性)")
+                  return (True, False, "月末/跨节资金结算窗口 (最后3个交易日，自动过滤短期回购冲高)")
 
               if d.day in (15, 16, 17):
 
-                  return (False, True, "月中结算/缴税窗口 (降权1级观察T+2)")
+                  return (False, True, "月中国债结算/缴税窗口 (降权1级观察T+2)")
 
               return (False, False, "常规非月末交易日 (有效权重 100%)")
 
@@ -232,7 +204,7 @@ jobs:
 
               req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}, method="POST")
 
-              with urllib.request.urlopen(req, timeout=20) as resp:
+              with urllib.request.urlopen(req, timeout=15) as resp:
 
                   print("[INFO] PushPlus 返回:", resp.read().decode("utf-8"))
 
@@ -246,45 +218,47 @@ jobs:
 
           try:
 
-              sofr_rows = fetch_fred_series("SOFR", 15)
-
-              iorb_rows = fetch_fred_series("IORB", 15)
-
-              rrp_rows = fetch_fred_series("RRPONTSYD", 10)
-
-              res_rows = fetch_fred_series("WRESBAL", 10)
-
-              tga_rows = fetch_fred_series("WTREGEN", 10)
-
-
-
-              iorb_val = iorb_rows[-1][1] if iorb_rows else 3.90
-
-              iorb_map = dict(iorb_rows)
+              sofr_hist = fetch_nyfed_sofr_history(15)
 
               history = []
 
-              last_iorb = iorb_val
+              for item in sofr_hist:
 
-              for dt_str, s_val in sofr_rows:
+                  is_me, is_mid, cal_lbl = classify_calendar(item["date"])
 
-                  if dt_str in iorb_map:
+                  sp_bps = round((item["sofr"] - CURRENT_IORB) * 100.0, 1)
 
-                      last_iorb = iorb_map[dt_str]
+                  history.append({
 
-                  is_me, is_mid, cal_lbl = classify_calendar(dt_str)
+                      "date": item["date"],
 
-                  history.append({"date": dt_str, "sofr": s_val, "iorb": last_iorb, "spread_bps": round((s_val - last_iorb) * 100.0, 1), "is_me": is_me, "is_mid": is_mid, "cal": cal_lbl})
+                      "sofr": item["sofr"],
+
+                      "p99": item["p99"],
+
+                      "vol_b": item["vol_b"],
+
+                      "spread_bps": sp_bps,
+
+                      "is_me": is_me,
+
+                      "is_mid": is_mid,
+
+                      "cal": cal_lbl,
+
+                  })
 
               if not history:
 
-                  history = [{"date": datetime.date.today().isoformat(), "sofr": 3.90, "iorb": 3.90, "spread_bps": 0.0, "is_me": False, "is_mid": False, "cal": "常规交易日"}]
+                  history = [{"date": datetime.date.today().isoformat(), "sofr": 3.90, "p99": 3.98, "vol_b": 0.0, "spread_bps": 0.0, "is_me": False, "is_mid": False, "cal": "常规交易日"}]
 
 
 
               latest = history[-1]
 
               spread_bps = latest["spread_bps"]
+
+              sofr_p99 = latest["p99"]
 
               non_me = [h for h in history if not h["is_me"]][-6:]
 
@@ -306,117 +280,135 @@ jobs:
 
 
 
-              sofr_p99 = fetch_nyfed_sofr_p99(latest["sofr"])
-
-              srf_ceiling = round(latest["iorb"] + 0.10, 2)
-
               srf_date, srf_b = fetch_nyfed_srf_usage()
 
 
 
-              raw_rrp = rrp_rows[-1][1] if rrp_rows else 0.3
+              vix_c, vix_chg, vix_dt, vix_5d_h = fetch_yahoo_quote("^VIX", 20.0)
 
-              on_rrp_b = round(raw_rrp / 1000.0 if raw_rrp > 5000 else raw_rrp, 2)
+              dxy_c, dxy_chg, _, _ = fetch_yahoo_quote("DX-Y.NYB", 104.0)
 
-              raw_res = res_rows[-1][1] if res_rows else 2980.0
+              _, spy_chg, _, _ = fetch_yahoo_quote("SPY", 0.0)
 
-              wres_t = round(raw_res / 1e6 if raw_res > 1e5 else raw_res / 1e3, 3)
+              _, qqq_chg, _, _ = fetch_yahoo_quote("QQQ", 0.0)
 
-              raw_tga = tga_rows[-1][1] if tga_rows else 917.0
-
-              prev_tga = tga_rows[-2][1] if len(tga_rows) >= 2 else raw_tga
-
-              tga_b = round(raw_tga / 1e3 if raw_tga > 1e4 else raw_tga, 1)
-
-              prev_tga_b = round(prev_tga / 1e3 if prev_tga > 1e4 else prev_tga, 1)
-
-              tga_delta_b = round(tga_b - prev_tga_b, 1)
+              _, gld_chg, _, _ = fetch_yahoo_quote("GLD", 0.0)
 
 
 
-              vix_c, vix_chg, vix_dt, vix_5d_h = fetch_quote("^VIX", "VIXCLS", 20.0)
+              vix_pullback_from_high = ((vix_c - vix_5d_h) / vix_5d_h * 100.0) if vix_5d_h > 0 else 0.0
 
-              dxy_c, dxy_chg, _, _ = fetch_quote("DX-Y.NYB", "DTWEXBGS", 105.0)
+              vix_is_rising = vix_chg > 3.0
 
-              _, spy_chg, _, _ = fetch_quote("SPY", "SP500", 0.0)
-
-              _, qqq_chg, _, _ = fetch_quote("QQQ", "NASDAQCOM", 0.0)
-
-              _, gld_chg, _, _ = fetch_quote("GLD", "", 0.0)
+              vix_is_cooling = (vix_5d_h >= 28.0) and (vix_chg <= -4.0 or vix_pullback_from_high <= -15.0)
 
 
 
-              zero_buffer = (on_rrp_b < 50.0) and (wres_t < 3.00)
+              alerts, buys, cautions = [], [], []
 
-              alerts, buys = [], []
-
-              risk = 1 if zero_buffer else 0
+              risk = 1
 
 
 
               if not latest["is_me"]:
 
-                  if spread_bps >= 4.0 and (sofr_p99 > srf_ceiling or srf_b >= 15.0 or srf_b < 0.5):
+                  if spread_bps >= 4.0 and (sofr_p99 > CURRENT_SRF_CEILING or srf_b >= 15.0):
 
                       risk = 3
 
-                      alerts.append(f"【回购逼仓红灯】非月末 SOFR-IORB 达 +{spread_bps}bp，99分位 {sofr_p99:.2f}% vs SRF上限 {srf_ceiling:.2f}%")
+                      alerts.append(f"【回购逼仓红灯】非月末 SOFR 达 {latest['sofr']:.2f}% (高出 IORB +{spread_bps}bp)，99分位 {sofr_p99:.2f}%，SRF用量 ${srf_b}B")
 
-                  elif consec_gt_2 >= 3 or sofr_p99 > srf_ceiling:
+                  elif consec_gt_2 >= 3:
 
                       risk = max(risk, 2)
 
-                      alerts.append(f"【回购吃紧橙灯】连续 {consec_gt_2} 日非月末 SOFR-IORB >= +2bp (当前 +{spread_bps}bp)")
+                      alerts.append(f"【回购吃紧橙灯】非月末 SOFR-IORB 已连续 {consec_gt_2} 日 >= +2bp (当前 +{spread_bps}bp)")
+
+                  elif sofr_p99 > CURRENT_SRF_CEILING and srf_b >= 10.0:
+
+                      risk = max(risk, 2)
+
+                      alerts.append(f"【尾端资金吃紧橙灯】99分位 SOFR ({sofr_p99:.2f}%) 突破 SRF 上限 (4.00%)，且 SRF 被动用 ${srf_b}B")
+
+              else:
+
+                  if srf_b >= 15.0 or sofr_p99 > CURRENT_SRF_CEILING:
+
+                      cautions.append(f"【月末/跨节资金紧绷提示】虽处月末结算窗口，但纽约联储 SRF 单日被借走 ${srf_b}B (99分位 SOFR 达 {sofr_p99:.2f}%)，显示一级交易商额度偏紧，反弹勿加过高杠杆")
 
 
 
-              if vix_c >= 28.0 or (vix_c >= 25.0 and vix_chg >= 20.0):
+              if (vix_c >= 28.0 and vix_is_rising) or (vix_c >= 25.0 and vix_chg >= 18.0):
 
                   risk = 3
 
-                  alerts.append(f"【跨资产追保红灯】VIX 飙至 {vix_c} ({vix_chg:+.2f}%)，警惕科技股与黄金同跌换现")
+                  alerts.append(f"【跨资产追保红灯】VIX 加速冲高至 {vix_c} (单日暴涨 {vix_chg:+.2f}%)，主经纪商追保易引发股金同跌")
 
-              elif vix_c >= 25.0 or vix_chg >= 15.0:
+              elif (vix_c >= 25.0 and vix_is_rising) or vix_chg >= 12.0:
 
                   risk = max(risk, 2)
 
-                  alerts.append(f"【波动率挤压橙灯】VIX 升至 {vix_c} ({vix_chg:+.2f}%)")
+                  alerts.append(f"【波动率升温橙灯】VIX 上行至 {vix_c} (单日 {vix_chg:+.2f}%)")
 
 
 
-              if vix_5d_h >= 28.0 and vix_chg <= -8.0 and spread_bps <= 2.0:
+              if vix_is_cooling and vix_c <= 27.5 and risk < 3:
 
-                  buys.append(f"【恐慌出清·右侧买点】VIX 从5日高点 {vix_5d_h} 回落 {vix_chg:.2f}% 至 {vix_c}，强平盘出清")
+                  buys.append(
 
-              if repo_healed and vix_c < 25.0:
+                      f"【恐慌退潮·右侧买点】VIX 从近5日高点 {vix_5d_h} 回落 {vix_pullback_from_high:.1f}% 至 {vix_c} (当日 {vix_chg:+.2f}%)，被动追保盘高峰已过"
 
-                  buys.append(f"【回购回血·右侧买点】SOFR-IORB 从 +{recent_max:.1f}bp 连续回落至 {spread_bps:+.1f}bp")
+                  )
 
-              if tga_delta_b <= -50.0 and spread_bps <= 1.0 and risk < 3:
+              if repo_healed and not vix_is_rising:
 
-                  buys.append(f"【财政放水·买点】TGA 单周向市场净投放 ${abs(tga_delta_b):.1f}B")
+                  buys.append(
+
+                      f"【回购回血·右侧买点】SOFR-IORB 从近期高点 +{recent_max:.1f}bp 回落至 {spread_bps:+.1f}bp，隔夜资金管道压力解除"
+
+                  )
 
 
 
               should_push = False
 
-              sig_type = "🟡 日常静默巡检 (零缓冲底色，无新增买卖点，平时不打扰)"
+              sig_type = "🟡 日常静默巡检 (无新增买卖点，平时不打扰)"
 
               advice = "当前处于常规观察期，继续观望，无需操作"
 
 
 
-              if risk == 3 and not buys:
+              if risk == 3:
 
-                  should_push, sig_type, advice = True, "🔴 【危险警告·三级红灯】跨资产流动性逼仓", "立刻降杠杆防御！严禁在 VIX 急升首日抄底黄金对冲"
+                  should_push = True
+
+                  sig_type = "🔴 【危险警告·三级红灯】流动性逼仓 / VIX 加速冲顶"
+
+                  advice = "立刻降杠杆防御！保留现金，严禁在 VIX 暴涨首日抄底黄金对冲"
 
               elif buys:
 
-                  should_push, sig_type, advice = True, "💎 【黄金买点信号】流动性回血 / 恐慌出清", "分批止盈 Put，逢低回补被错杀的核心科技股与黄金"
+                  should_push = True
+
+                  if srf_b >= 15.0:
+
+                      sig_type = "💎 【右侧买点 (附月末SRF紧绷提示)】恐慌退潮但资金面偏紧"
+
+                      advice = "VIX 追保恐慌已退潮，可分批止盈 Put 或轻仓回补核心科技股；但因今日 SRF 用量高达 $" + str(srf_b) + "B，切勿满仓追高"
+
+                  else:
+
+                      sig_type = "💎 【黄金买点信号】恐慌退潮 / 流动性回血"
+
+                      advice = "分批止盈保护性 Put，逢低回补被错杀的核心科技股与黄金"
 
               elif risk == 2:
 
-                  should_push, sig_type, advice = True, "🟠 【减仓预警·二级橙灯】局部流动性挤压", "主动削减高 Beta 科技/加密仓位，或买短期虚值 Put 保护"
+                  should_push = True
+
+                  sig_type = "🟠 【减仓预警·二级橙灯】流动性或波动率升温"
+
+                  advice = "主动削减高 Beta 科技/加密仓位，或买短期虚值 Put 保护"
 
 
 
@@ -432,29 +424,55 @@ jobs:
 
                   "",
 
-                  "#### 📊 核心流动性与跨资产快照",
-
-                  f"- **SOFR - IORB 利差 ({latest['date']})**：`{spread_bps:+.1f} bps`（99分位 `{sofr_p99:.2f}%` vs SRF上限 `{srf_ceiling:.2f}%`）",
-
-                  f"- **日历属性**：{latest['cal']}",
-
-                  f"- **准备金与缓冲垫**：准备金 `{wres_t}T` | ON RRP `${on_rrp_b}B` | SRF用量 `${srf_b}B`",
-
-                  f"- **财政部 TGA 余额**：`${tga_b}B`（周变动 `{tga_delta_b:+.1f}B`）",
-
-                  f"- **VIX 恐慌指数 ({vix_dt})**：`{vix_c}`（单日 `{vix_chg:+.2f}%`，5日高点 `{vix_5d_h}`）",
-
-                  f"- **跨资产表现**：标普 `{spy_chg:+.2f}%` | 纳指 `{qqq_chg:+.2f}%` | 黄金 `{gld_chg:+.2f}%` | 美元 `{dxy_c}`",
-
               ]
 
               if buys:
 
-                  lines.insert(3, "#### 💎 触发买点明细\n" + "\n".join(f"- {s}" for s in buys) + "\n")
+                  lines.append("#### 💎 触发买点明细")
+
+                  for s in buys:
+
+                      lines.append(f"- {s}")
+
+                  lines.append("")
 
               if alerts:
 
-                  lines.insert(3, "#### ⚠️ 触发风险预警明细\n" + "\n".join(f"- {s}" for s in alerts) + "\n")
+                  lines.append("#### ⚠️ 触发风险预警明细")
+
+                  for s in alerts:
+
+                      lines.append(f"- {s}")
+
+                  lines.append("")
+
+              if cautions:
+
+                  lines.append("#### 📌 结构性资金面提示")
+
+                  for s in cautions:
+
+                      lines.append(f"- {s}")
+
+                  lines.append("")
+
+
+
+              lines.extend([
+
+                  "#### 📊 纽约联储官方回购与跨资产快照",
+
+                  f"- **SOFR 真实利率 ({latest['date']})**：`{latest['sofr']:.2f}%` vs IORB `3.90%`（利差 `{spread_bps:+.1f} bps`）",
+
+                  f"- **99分位尾端利率 & SRF 用量**：99分位 `{sofr_p99:.2f}%`（SRF上限 `4.00%`）| **SRF单日用量 `${srf_b}B`** (`{srf_date}`)",
+
+                  f"- **日历属性**：{latest['cal']}",
+
+                  f"- **VIX 恐慌指数 ({vix_dt})**：`{vix_c}`（单日 `{vix_chg:+.2f}%`，近5日高点 `{vix_5d_h}`，距高点 `{vix_pullback_from_high:+.1f}%`）",
+
+                  f"- **跨资产表现**：标普 `{spy_chg:+.2f}%` | 纳指 `{qqq_chg:+.2f}%` | 黄金 `{gld_chg:+.2f}%` | 美元 `{dxy_c}`",
+
+              ])
 
 
 
@@ -470,7 +488,6 @@ jobs:
 
               print(traceback.format_exc())
 
-              send_pushplus(token, "【美元流动性雷达】测试连通提醒", f"微信推送已连通，异常信息：`{exc}`")
+              send_pushplus(token, "【美元流动性雷达】运行异常提醒", f"异常信息：`{exc}`")
 
           EOF
-
